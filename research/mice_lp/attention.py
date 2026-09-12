@@ -168,6 +168,24 @@ def hard_masked_attention(q: Tensor, k: Tensor, v: Tensor, layout: SequenceLayou
     return torch.einsum("bhqk,bhkd->bhqd", A, v.float()).to(v.dtype)
 
 
+def to_layout_order(x: Tensor, num_txt: int, num_target: int, num_context: int) -> Tensor:
+    """Reorder a [B,H,N,D] tensor from FLUX.2's real concat order [txt, target, context]
+    (denoise()'s img_input = cat([img, img_cond_seq]), context tokens appended last) to the
+    [text, context, latent] order SequenceLayout/build_layout assumes."""
+    txt_s = slice(0, num_txt)
+    tgt_s = slice(num_txt, num_txt + num_target)
+    ctx_s = slice(num_txt + num_target, num_txt + num_target + num_context)
+    return torch.cat([x[:, :, txt_s, :], x[:, :, ctx_s, :], x[:, :, tgt_s, :]], dim=2)
+
+
+def from_layout_order(x: Tensor, num_txt: int, num_target: int, num_context: int) -> Tensor:
+    """Inverse of to_layout_order: [text, context, latent] -> [txt, target, context]."""
+    txt_s = slice(0, num_txt)
+    ctx_s = slice(num_txt, num_txt + num_context)
+    tgt_s = slice(num_txt + num_context, num_txt + num_context + num_target)
+    return torch.cat([x[:, :, txt_s, :], x[:, :, tgt_s, :], x[:, :, ctx_s, :]], dim=2)
+
+
 def mice_lp_attention(q: Tensor, k: Tensor, v: Tensor, layout: SequenceLayout, sigma: float, eps: float = 1e-6) -> Tensor:
     """O = O_own (hard) + sum_c blurred visual cross-source injections, latent-instance queries only.
 

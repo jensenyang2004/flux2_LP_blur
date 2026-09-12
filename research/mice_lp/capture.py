@@ -34,6 +34,7 @@ from flux2.sampling import batched_prc_img, batched_prc_txt, denoise, encode_ima
 from flux2.text_encoder import Qwen3Embedder
 from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model
 
+from .attention import to_layout_order
 from .data import load_meta
 from .regions import build_regions
 
@@ -168,16 +169,9 @@ def capture(
             f"sequence length mismatch: N={N} != txt({num_txt_tokens}) + target({n_target}) + context({n_context})"
         )
 
-    # denoise()'s own concat order is [txt, target, context] (img_input = cat([img, img_cond_seq]));
-    # reorder to [text, context, latent] to match mice_lp.attention.build_layout's convention.
-    txt_s = slice(0, num_txt_tokens)
-    tgt_s = slice(num_txt_tokens, num_txt_tokens + n_target)
-    ctx_s = slice(num_txt_tokens + n_target, N)
-
-    def reorder(t: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t[:, :, txt_s, :], t[:, :, ctx_s, :], t[:, :, tgt_s, :]], dim=2)
-
-    captured["q"], captured["k"], captured["v"] = reorder(q), reorder(k), reorder(v)
+    captured["q"] = to_layout_order(q, num_txt_tokens, n_target, n_context)
+    captured["k"] = to_layout_order(k, num_txt_tokens, n_target, n_context)
+    captured["v"] = to_layout_order(v, num_txt_tokens, n_target, n_context)
     captured.update(
         {
             "latent_region": region_id,
