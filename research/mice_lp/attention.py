@@ -77,21 +77,31 @@ def build_layout(
     latent_region_grid: Tensor,
     context_region_grid: Tensor,
     text_group_lengths: list[int],
+    text_prefix_len: int = 0,
+    n_text_total: int | None = None,
 ) -> SequenceLayout:
     """latent_region_grid/context_region_grid: int64 [h*w] in [0,K) or -1 for background.
     text_group_lengths: length-K, per-instance text token counts, concatenated in order 0..K-1.
+    text_prefix_len: leading ungrouped span before instance 0's text starts (e.g. a
+    chat-template preamble on a jointly-encoded prompt) - stays text_group=-1, "own" to nobody.
+    n_text_total: the actual encoded text sequence length, if longer than
+    text_prefix_len + sum(text_group_lengths) (e.g. trailing chat-template/padding tokens) -
+    those trailing positions also stay text_group=-1. Defaults to
+    text_prefix_len + sum(text_group_lengths) when not given.
     """
     assert len(text_group_lengths) == K
     assert latent_region_grid.numel() == h * w
     assert context_region_grid.numel() == h * w
 
-    n_text = sum(text_group_lengths)
+    grouped_len = text_prefix_len + sum(text_group_lengths)
+    n_text = grouped_len if n_text_total is None else n_text_total
+    assert n_text >= grouped_len, (n_text, grouped_len, "text_group_lengths (+ prefix) exceed the declared total")
     n_ctx = context_region_grid.numel()
     n_lat = latent_region_grid.numel()
     N = n_text + n_ctx + n_lat
 
     text_group = torch.full((N,), -1, dtype=torch.long)
-    off = 0
+    off = text_prefix_len
     for k, length in enumerate(text_group_lengths):
         text_group[off : off + length] = k
         off += length

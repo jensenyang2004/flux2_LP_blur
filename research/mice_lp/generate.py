@@ -47,7 +47,7 @@ from einops import rearrange
 from PIL import Image
 
 from flux2 import model as flux2_model
-from flux2.sampling import batched_prc_img, denoise, encode_image_refs, get_schedule, prc_txt, scatter_ids
+from flux2.sampling import batched_prc_img, batched_prc_txt, denoise, encode_image_refs, get_schedule, scatter_ids
 from flux2.text_encoder import Qwen3Embedder
 from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model
 
@@ -56,41 +56,54 @@ from .data import SampleSpec, load_meta
 from .regions import build_regions
 
 TEXT_ENCODER_MODEL_SPEC = "Qwen/Qwen3-4B"  # see capture.py: avoids the FP8-kernel/triton mess
-PER_INSTANCE_TEXT_MAX_LENGTH = 32  # "change X into Y" is a handful of tokens, not a full sentence
 DEFAULT_GATED_STEPS = [2, 3]  # last two of Klein-4B's default 4-step schedule
 DEFAULT_GATED_BLOCKS = [21, 22, 23, 24]  # last 4 single-stream blocks (indices 5..24 are single-stream)
 
 
 def encode_instance_prompts(text_encoder: Qwen3Embedder, sample: SampleSpec, instance_names: list[str]):
-    """Encode each kept instance's own "change X into Y" instruction separately, concatenated
-    along the sequence axis with a distinct RoPE t-offset per instance (t_scale mirrors
-    sampling.encode_image_refs's t_off = scale + scale*i convention).
+    """One joined natural-language prompt (all instances' instructions concatenated with
+    ". "), encoded in a SINGLE text_encoder([...]) call - the standard single-prompt path
+    (t=0, sequential positions via batched_prc_txt, same convention used everywhere else in
+    this codebase for a combined instruction like edit_inst_single).
 
-    Returns (ctx [1, K*max_length, dim] bf16, ctx_ids [1, K*max_length, 4], text_group_lengths).
+    Per-instance own_mask boundaries are recovered approximately: each instruction's
+    standalone token count estimates its span within the jointly-tokenized sequence (can be
+    off by a token or two at ". " boundaries where subword merging differs slightly in
+    context vs. isolation - accepted slop for this research prototype). The chat-template
+    preamble before the content starts is measured exactly (by finding where the raw content
+    lands inside the chat-templated string) and kept ungrouped - "own" to no instance.
+
+    Returns (ctx [1, L, dim] bf16, ctx_ids [1, L, 4], text_group_lengths, text_prefix_len).
     """
     name_to_instruction = {inst.source_prompt: inst.instruction for inst in sample.instances}
-    prompts = [name_to_instruction[name] for name in instance_names]
+    instructions = [name_to_instruction[name] for name in instance_names]
+    full_prompt = ". ".join(instructions) + "."
 
-    original_max_length = text_encoder.max_length
-    text_encoder.max_length = PER_INSTANCE_TEXT_MAX_LENGTH
-    try:
-        embeds = text_encoder(prompts).to(torch.bfloat16)  # [K, max_length, dim]
-    finally:
-        text_encoder.max_length = original_max_length
+    tokenizer = text_encoder.tokenizer
+    wrapped = tokenizer.apply_chat_template(
+        [{"role": "user", "content": full_prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    prefix_text = wrapped[: wrapped.index(full_prompt)]
+    text_prefix_len = len(tokenizer(prefix_text, add_special_tokens=False)["input_ids"])
+    text_group_lengths = [len(tokenizer(instr, add_special_tokens=False)["input_ids"]) for instr in instructions]
 
-    K = embeds.shape[0]
-    t_scale = 10
-    tokens_list, ids_list = [], []
-    for i in range(K):
-        t_coord = torch.tensor([t_scale + t_scale * i])
-        toks, ids = prc_txt(embeds[i], t_coord=t_coord)
-        tokens_list.append(toks)
-        ids_list.append(ids)
+    ctx = text_encoder([full_prompt]).to(torch.bfloat16)  # [1, max_length, dim], standard single-prompt call
+    ctx, ctx_ids = batched_prc_txt(ctx)
+    num_txt_tokens = ctx.shape[1]
 
-    ctx = torch.cat(tokens_list, dim=0).unsqueeze(0)
-    ctx_ids = torch.cat(ids_list, dim=0).unsqueeze(0)
-    text_group_lengths = [PER_INSTANCE_TEXT_MAX_LENGTH] * K
-    return ctx, ctx_ids, text_group_lengths
+    grouped_len = text_prefix_len + sum(text_group_lengths)
+    if grouped_len > num_txt_tokens:
+        raise ValueError(
+            f"estimated text span ({text_prefix_len} preamble + {sum(text_group_lengths)} content = "
+            f"{grouped_len}) exceeds the encoded sequence length ({num_txt_tokens}) - the joined "
+            f"instructions were likely truncated by Qwen3Embedder.max_length={text_encoder.max_length}; "
+            "shorten the prompt set or raise max_length."
+        )
+
+    return ctx, ctx_ids, text_group_lengths, text_prefix_len
 
 
 def _make_gated_attn_fn(original_fn, blocks_per_forward, gated_steps, gated_blocks, layout, num_txt, n_target, n_context, mode, sigma):
@@ -164,7 +177,9 @@ def generate(
                 "encode_image_refs likely rescaled the image beyond its pixel cap."
             )
 
-        ctx, ctx_ids, text_group_lengths = encode_instance_prompts(text_encoder, sample, regions.instance_names)
+        ctx, ctx_ids, text_group_lengths, text_prefix_len = encode_instance_prompts(
+            text_encoder, sample, regions.instance_names
+        )
         num_txt_tokens = ctx.shape[1]
 
         shape = (1, 128, h_c // 16, w_c // 16)
@@ -175,7 +190,10 @@ def generate(
 
         timesteps = get_schedule(num_steps=4, image_seq_len=x.shape[1])
 
-        layout = build_layout(K, regions.h, regions.w, region_id, region_id, text_group_lengths)
+        layout = build_layout(
+            K, regions.h, regions.w, region_id, region_id, text_group_lengths,
+            text_prefix_len=text_prefix_len, n_text_total=num_txt_tokens,
+        )
         layout = layout.to(device)  # build_layout is CPU-only bookkeeping; q/k/v live on `device`
 
         if mode == "plain":
