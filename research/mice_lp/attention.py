@@ -44,11 +44,30 @@ class SequenceLayout:
     def group_of_query(self) -> Tensor:
         """Per-query group id: text_group for text rows, latent_region for latent-instance rows,
         UNRESTRICTED for everything else (background latent, every context row)."""
-        g = torch.full((self.N,), UNRESTRICTED, dtype=torch.long)
+        g = torch.full((self.N,), UNRESTRICTED, dtype=torch.long, device=self.is_text.device)
         g[self.is_text] = self.text_group[self.is_text]
         lat_inst = self.is_latent_instance
         g[lat_inst] = self.latent_region[lat_inst]
         return g
+
+    def to(self, device: torch.device | str) -> "SequenceLayout":
+        """build_layout always constructs on CPU (pure region/index bookkeeping - no need for a
+        GPU there). Call this once, after building, to move onto q/k/v's device before using it
+        in mice_lp_attention/hard_masked_attention during a real forward pass."""
+        return SequenceLayout(
+            n_text=self.n_text,
+            n_context=self.n_context,
+            n_latent=self.n_latent,
+            K=self.K,
+            h=self.h,
+            w=self.w,
+            is_text=self.is_text.to(device),
+            is_context=self.is_context.to(device),
+            is_latent=self.is_latent.to(device),
+            text_group=self.text_group.to(device),
+            latent_region=self.latent_region.to(device),
+            context_region=self.context_region.to(device),
+        )
 
 
 def build_layout(

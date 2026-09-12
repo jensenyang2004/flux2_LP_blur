@@ -176,6 +176,7 @@ def generate(
         timesteps = get_schedule(num_steps=4, image_seq_len=x.shape[1])
 
         layout = build_layout(K, regions.h, regions.w, region_id, region_id, text_group_lengths)
+        layout = layout.to(device)  # build_layout is CPU-only bookkeeping; q/k/v live on `device`
 
         if mode == "plain":
             print("mode=plain: no gating, ordinary generation")
