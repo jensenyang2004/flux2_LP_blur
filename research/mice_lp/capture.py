@@ -31,10 +31,19 @@ from PIL import Image
 
 from flux2 import model as flux2_model
 from flux2.sampling import batched_prc_img, batched_prc_txt, denoise, encode_image_refs, get_schedule
-from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model, load_text_encoder
+from flux2.text_encoder import Qwen3Embedder
+from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model
 
 from .data import load_meta
 from .regions import build_regions
+
+# util.load_text_encoder("flux.2-klein-4b") hardcodes "Qwen/Qwen3-4B-FP8", which pulls in
+# transformers' Hub-kernel FP8 matmul path (kernels-community/finegrained-fp8) - fragile
+# against the installed triton version and irrelevant here. Qwen3Embedder is architecture-
+# identical for the plain bf16 checkpoint (same hidden size, same layer count, same
+# OUTPUT_LAYERS_QWEN3 indices), so this produces the same shape and semantically equivalent
+# (not bit-identical) embeddings without touching the FP8 kernel path at all.
+TEXT_ENCODER_MODEL_SPEC = "Qwen/Qwen3-4B"
 
 
 class _CaptureDone(Exception):
@@ -81,8 +90,8 @@ def capture(
         raise ValueError(f"sample {sample_key} is malformed: {skipped[sample_key]}")
     sample = meta[sample_key]
 
-    print(f"Loading {model_name}: transformer + its own text encoder + AE (no moderation model)...")
-    text_encoder = load_text_encoder(model_name, device=device)
+    print(f"Loading {model_name}: transformer + AE + Qwen3-4B text encoder (bf16, not the FP8 checkpoint)...")
+    text_encoder = Qwen3Embedder(model_spec=TEXT_ENCODER_MODEL_SPEC, device=device)
     model = load_flow_model(model_name, device=device)
     ae = load_ae(model_name, device=device)
     model.eval()
