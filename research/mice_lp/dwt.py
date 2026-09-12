@@ -79,6 +79,21 @@ def energy(x: Tensor) -> Tensor:
     return (x.float() ** 2).sum(dim=(-2, -1))
 
 
+def max_haar_levels(h: int, w: int) -> int:
+    """Largest L such that h and w are both divisible by 2**L. Real region grids (e.g. 30x40)
+    are rarely nice powers of two, so this is usually 1-2, not the 3 the spec assumed for a
+    64x64 grid - check this before picking `levels` for band_energy_profile."""
+
+    def _pow2(n: int) -> int:
+        L = 0
+        while n % 2 == 0:
+            n //= 2
+            L += 1
+        return L
+
+    return min(_pow2(h), _pow2(w))
+
+
 def band_energy_profile(x: Tensor, h: int, w: int, levels: int) -> dict[str, Tensor]:
     """Fraction of total energy (exact, by Parseval) carried by each frequency band.
 
