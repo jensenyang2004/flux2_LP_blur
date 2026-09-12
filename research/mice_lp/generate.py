@@ -1,5 +1,5 @@
 """Run a REAL multi-instance edit through FLUX.2 Klein-4B and save the decoded output image,
-gating attention at selected (step, block) pairs with one of three regimes:
+gating attention at selected (step, block) pairs with one of four regimes:
 
   plain - no gating at all, ordinary generation (upper bound on harmonization, per the
           original sweep protocol's setting #1)
@@ -7,9 +7,19 @@ gating attention at selected (step, block) pairs with one of three regimes:
           softmax denominator is untouched, only the numerator's excluded terms are dropped).
           NOTE this is setting #3 in the original sweep table ("zeroed post-softmax"), not
           #2 ("zeroed pre-softmax", changes the denominator) - it is NOT a literal MICE
-          reproduction, just the closest hard-mask reference this codebase has built.
-  blur  - the actual hypothesis: own_mask + LP-blurred visual cross-source injection
-          (mice_lp_attention).
+          reproduction. Known to collapse badly if gated at every block/step (discards most
+          of a restrictive query's softmax mass with nothing to replace it) - keep this
+          scoped to a few late blocks/steps, as originally planned.
+  blur  - own_mask + LP-blurred visual cross-source injection (mice_lp_attention). Also known
+          to degrade if gated everywhere (spatial smoothing compounds across many layers) -
+          same scoping caveat as hard.
+  rank  - the newer hypothesis: restrict cross-region information by CAPACITY (how many
+          independent vectors can cross a region boundary), not magnitude. Starts from full
+          vanilla attention and replaces what a foreign query reads from a source with a
+          pooled (<=r cells) version, using that query's own real attention mass - never
+          zeroed, never blended across different queries' outputs, hull-preserving at any r.
+          This is the one expected to tolerate wide (even every-block) gating, per the
+          reasoning in rank_limited_attention's docstring.
 
 Per-instance text: each instance's "change X into Y" instruction (InstanceSpec.instruction)
 is encoded SEPARATELY (short max_length, since these are a few words each - not the 512-token
@@ -51,7 +61,14 @@ from flux2.sampling import batched_prc_img, batched_prc_txt, denoise, encode_ima
 from flux2.text_encoder import Qwen3Embedder
 from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model
 
-from .attention import build_layout, from_layout_order, hard_masked_attention, mice_lp_attention, to_layout_order
+from .attention import (
+    build_layout,
+    from_layout_order,
+    hard_masked_attention,
+    mice_lp_attention,
+    rank_limited_attention,
+    to_layout_order,
+)
 from .data import SampleSpec, load_meta
 from .regions import build_regions
 
@@ -106,7 +123,9 @@ def encode_instance_prompts(text_encoder: Qwen3Embedder, sample: SampleSpec, ins
     return ctx, ctx_ids, text_group_lengths, text_prefix_len
 
 
-def _make_gated_attn_fn(original_fn, blocks_per_forward, gated_steps, gated_blocks, layout, num_txt, n_target, n_context, mode, sigma):
+def _make_gated_attn_fn(
+    original_fn, blocks_per_forward, gated_steps, gated_blocks, layout, num_txt, n_target, n_context, mode, sigma, r
+):
     state = {"call_count": 0}
 
     def patched(q, k, v, num_txt_tokens, num_ref_tokens, kv_cache=None):
@@ -119,6 +138,8 @@ def _make_gated_attn_fn(original_fn, blocks_per_forward, gated_steps, gated_bloc
             v_l = to_layout_order(v, num_txt, n_target, n_context)
             if mode == "hard":
                 out_l = hard_masked_attention(q_l, k_l, v_l, layout)
+            elif mode == "rank":
+                out_l = rank_limited_attention(q_l, k_l, v_l, layout, r=r)
             else:
                 out_l = mice_lp_attention(q_l, k_l, v_l, layout, sigma=sigma)
             out = from_layout_order(out_l, num_txt, n_target, n_context)
@@ -134,13 +155,14 @@ def generate(
     out_path: Path,
     mode: str = "blur",
     sigma: float = 2.0,
+    r: int = 1,
     gated_steps: list[int] | None = None,
     gated_blocks: list[int] | None = None,
     model_name: str = "flux.2-klein-4b",
     seed: int = 0,
     device: str = "cuda",
 ) -> None:
-    assert mode in ("plain", "hard", "blur"), mode
+    assert mode in ("plain", "hard", "blur", "rank"), mode
     gated_steps = set(DEFAULT_GATED_STEPS if gated_steps is None else gated_steps)
     gated_blocks = set(DEFAULT_GATED_BLOCKS if gated_blocks is None else gated_blocks)
 
@@ -205,11 +227,12 @@ def generate(
             )
         else:
             blocks_per_forward = len(model.double_blocks) + len(model.single_blocks)
-            print(f"mode={mode}: gating steps={sorted(gated_steps)} blocks={sorted(gated_blocks)} sigma={sigma}")
+            extra = f"r={r}" if mode == "rank" else f"sigma={sigma}"
+            print(f"mode={mode}: gating steps={sorted(gated_steps)} blocks={sorted(gated_blocks)} {extra}")
             original_fn = flux2_model.causal_attn_fn
             flux2_model.causal_attn_fn = _make_gated_attn_fn(
                 original_fn, blocks_per_forward, gated_steps, gated_blocks,
-                layout, num_txt_tokens, n_target, n_context, mode, sigma,
+                layout, num_txt_tokens, n_target, n_context, mode, sigma, r,
             )
             try:
                 x = denoise(
@@ -236,8 +259,9 @@ def main():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--sample", default="00")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mode", choices=["plain", "hard", "blur"], default="blur")
-    parser.add_argument("--sigma", type=float, default=2.0)
+    parser.add_argument("--mode", choices=["plain", "hard", "blur", "rank"], default="blur")
+    parser.add_argument("--sigma", type=float, default=2.0, help="blur mode only")
+    parser.add_argument("--r", type=int, default=1, help="rank mode only - cells per foreign region (1=max bottleneck)")
     parser.add_argument("--gated-steps", type=str, default=None, help="comma-separated 0-indexed step indices, e.g. 2,3")
     parser.add_argument("--gated-blocks", type=str, default=None, help="comma-separated 0-indexed block indices (0..24 for Klein-4B)")
     parser.add_argument("--seed", type=int, default=0)
@@ -248,7 +272,7 @@ def main():
 
     generate(
         args.data_root, args.sample, args.out,
-        mode=args.mode, sigma=args.sigma,
+        mode=args.mode, sigma=args.sigma, r=args.r,
         gated_steps=gated_steps, gated_blocks=gated_blocks, seed=args.seed,
     )
 

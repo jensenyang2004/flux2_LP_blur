@@ -215,6 +215,86 @@ def from_layout_order(x: Tensor, num_txt: int, num_target: int, num_context: int
     return torch.cat([x[:, :, txt_s, :], x[:, :, tgt_s, :], x[:, :, ctx_s, :]], dim=2)
 
 
+def _grid_positions(layout: SequenceLayout, idx: Tensor) -> tuple[Tensor, Tensor]:
+    """Row-major (row, col) grid positions for global sequence indices `idx`, which must all
+    lie entirely within either the context block or the latent block (both live on the same
+    h,w grid, per build_regions' same-pixel-layout assumption)."""
+    offset = (layout.n_text + layout.n_context) if layout.is_latent[idx[0]] else layout.n_text
+    grid_idx = idx - offset
+    return grid_idx // layout.w, grid_idx % layout.w
+
+
+def _cell_ids_for_region(layout: SequenceLayout, idx: Tensor, r: int) -> tuple[Tensor, int]:
+    """Assign each region token (global indices `idx`) a cell id in [0, r_eff), via an
+    r_side x r_side grid over the region's spatial bounding box (r_side = round(sqrt(r))).
+    r_eff = r_side**2; if that's >= the region's token count, returns one cell per token
+    (exact identity - the caller skips pooling entirely in that case)."""
+    n = idx.numel()
+    r_side = max(1, round(r**0.5))
+    r_eff = r_side * r_side
+    if r_eff >= n:
+        return torch.arange(n, device=idx.device), n
+
+    rows, cols = _grid_positions(layout, idx)
+    row_span = (rows.max() - rows.min() + 1).clamp(min=1)
+    col_span = (cols.max() - cols.min() + 1).clamp(min=1)
+    row_bin = ((rows - rows.min()) * r_side // row_span).clamp(max=r_side - 1)
+    col_bin = ((cols - cols.min()) * r_side // col_span).clamp(max=r_side - 1)
+    return row_bin * r_side + col_bin, r_eff
+
+
+def rank_limited_attention(q: Tensor, k: Tensor, v: Tensor, layout: SequenceLayout, r: int) -> Tensor:
+    """Restrict cross-region information by CAPACITY (rank) instead of magnitude.
+
+    Starts from full, standard attention (softmax denominator untouched, nothing zeroed or
+    renormalized) and, for each foreign visual source, REPLACES what a query actually read
+    from that source with a pooled (<= r independent vectors) version, using the exact same
+    total attention mass that query already earned. Every replacement is a convex combination
+    of real V rows for that one query alone - never blended across different queries the way
+    the spatial blur is - so it's hull-preserving at any r, which is the property that should
+    let it tolerate being applied at every block/step where the blur couldn't.
+
+    At r >= a source's own token count this exactly reproduces vanilla_attention for that
+    source (no restriction possible). Scoped to visual cross-sources only, matching the
+    proposal - foreign TEXT is left untouched here; layer a separate text policy on top if
+    still wanted.
+    """
+    D = q.shape[-1]
+    logits = torch.einsum("bhqd,bhkd->bhqk", q.float(), k.float()) * D**-0.5
+    A = torch.softmax(logits, dim=-1)
+    v_f = v.float()
+
+    O = torch.einsum("bhqk,bhkd->bhqd", A, v_f)  # full, unmodified attention - the base
+
+    lat_slice = layout.is_latent
+    A_lat = A[:, :, lat_slice, :]  # [B,H,n_lat,N]
+
+    for key_mask, foreign in _visual_cross_sources(layout):
+        idx = key_mask.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0 or not foreign.any():
+            continue
+
+        Ac = A_lat[:, :, :, idx]  # [B,H,n_lat,|region|]
+        Vc = v_f[:, :, idx, :]  # [B,H,|region|,D]
+
+        cell_id, r_eff = _cell_ids_for_region(layout, idx, r)
+        if r_eff >= idx.numel():
+            continue  # pooling into >= as many cells as tokens changes nothing
+
+        onehot = torch.nn.functional.one_hot(cell_id, num_classes=r_eff).to(Ac.dtype)  # [|region|, r_eff]
+        counts = onehot.sum(dim=0).clamp(min=1)  # [r_eff]
+        Vbar = torch.einsum("rj,bhrd->bhjd", onehot, Vc) / counts[None, None, :, None]  # [B,H,r_eff,D]
+        massb = torch.einsum("bhqr,rj->bhqj", Ac, onehot)  # [B,H,n_lat,r_eff]
+
+        original_contrib = torch.einsum("bhqk,bhkd->bhqd", Ac, Vc)
+        pooled_contrib = torch.einsum("bhqj,bhjd->bhqd", massb, Vbar)
+
+        foreign_f = foreign.to(A.dtype)[None, None, :, None]
+        O[:, :, lat_slice, :] += foreign_f * (pooled_contrib - original_contrib)
+
+    return O.to(v.dtype)
+
+
 def mice_lp_attention(q: Tensor, k: Tensor, v: Tensor, layout: SequenceLayout, sigma: float, eps: float = 1e-6) -> Tensor:
     """O = O_own (hard) + sum_c blurred visual cross-source injections, latent-instance queries only.
 
