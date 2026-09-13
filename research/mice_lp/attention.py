@@ -150,6 +150,34 @@ def own_mask_matrix(layout: SequenceLayout) -> Tensor:
     return unrestricted | same_text | same_latent | same_context
 
 
+def _text_segment_mask(layout: SequenceLayout) -> Tensor:
+    """[N_query, N_key] bool, True where a KEY must be masked to -inf: it's text belonging to
+    a different instance group than the query's own. Only text keys are ever masked here -
+    this restricts nothing about visual (latent/context) keys. Background-latent and context
+    queries are UNRESTRICTED (group_of_query gives them the sentinel), so they keep full,
+    unrestricted access to every text segment, same as everything else - only text queries and
+    latent-instance queries (which have a real group) get their foreign text excluded."""
+    g = layout.group_of_query()  # [N]
+    has_group = (g != UNRESTRICTED).unsqueeze(1)  # [N,1]
+    is_foreign_text = layout.is_text.unsqueeze(0) & (layout.text_group.unsqueeze(0) != g.unsqueeze(1))
+    return has_group & is_foreign_text
+
+
+def _compute_A(q: Tensor, k: Tensor, layout: SequenceLayout | None = None, text_hard: bool = False) -> Tensor:
+    """softmax(QK^T/sqrt(d)), optionally with foreign text masked to -inf BEFORE softmax
+    (text_hard=True) - a clean, properly-renormalized segmentation: each instance's own text
+    is fully separated from every other instance's, with the softmax correctly redistributing
+    its mass over whatever remains visible. Unlike restricting a tiny visual region this way,
+    only excludes a modest slice of the key axis (foreign text), so it shouldn't have the
+    magnitude-collapse problem hard_masked_attention has when applied to whole visual regions."""
+    D = q.shape[-1]
+    logits = torch.einsum("bhqd,bhkd->bhqk", q.float(), k.float()) * D**-0.5
+    if text_hard:
+        assert layout is not None, "text_hard=True requires a layout"
+        logits = logits.masked_fill(_text_segment_mask(layout), float("-inf"))
+    return torch.softmax(logits, dim=-1)
+
+
 def _visual_cross_sources(layout: SequenceLayout) -> list[tuple[Tensor, Tensor]]:
     """List of (key_mask [N], foreign [N_latent]) for every visual (non-text) source group.
 
@@ -176,6 +204,23 @@ def _visual_cross_sources(layout: SequenceLayout) -> list[tuple[Tensor, Tensor]]
     sources.append((lat_bg_mask, is_lat_inst_at_lat.clone()))
     ctx_bg_mask = layout.is_context & (layout.context_region < 0)
     sources.append((ctx_bg_mask, is_lat_inst_at_lat.clone()))
+    return sources
+
+
+def _text_cross_sources(layout: SequenceLayout) -> list[tuple[Tensor, Tensor]]:
+    """List of (key_mask [N], foreign [N_latent]) for every OTHER instance's text span, from
+    the perspective of latent-instance queries. Mirrors _visual_cross_sources exactly, keyed
+    on text tokens instead of visual ones - a latent-instance query in region j is foreign to
+    every text group except its own."""
+    lat_inst = layout.is_latent_instance
+    lat_region_at_lat = layout.latent_region[layout.is_latent]
+    is_lat_inst_at_lat = lat_inst[layout.is_latent]
+
+    sources = []
+    for j in range(layout.K):
+        key_mask = layout.text_group == j
+        foreign = is_lat_inst_at_lat & (lat_region_at_lat != j)
+        sources.append((key_mask, foreign))
     return sources
 
 
@@ -243,25 +288,73 @@ def _cell_ids_for_region(layout: SequenceLayout, idx: Tensor, r: int) -> tuple[T
     return row_bin * r_side + col_bin, r_eff
 
 
-def rank_limited_attention(q: Tensor, k: Tensor, v: Tensor, layout: SequenceLayout, r: int) -> Tensor:
+def _cell_ids_sequential(n: int, r: int, device) -> tuple[Tensor, int]:
+    """Simple 1D chunking into r contiguous cells, in token order - used for text spans, which
+    have no spatial bounding box the way image regions do."""
+    r_eff = min(max(1, r), n)
+    if r_eff >= n:
+        return torch.arange(n, device=device), n
+    idx = torch.arange(n, device=device)
+    cell_id = (idx * r_eff) // n
+    return cell_id, r_eff
+
+
+def _pool_and_replace(
+    O: Tensor, A_lat: Tensor, v_f: Tensor, lat_slice: Tensor, idx: Tensor, foreign: Tensor, cell_id: Tensor, r_eff: int
+) -> None:
+    """In place: for the latent-instance query rows, replace what was actually read from the
+    keys at `idx` with a pooled (r_eff cells) version, weighted by each query's own real
+    attention mass on those keys. Convex combination per query - never blended across queries."""
+    Ac = A_lat[:, :, :, idx]  # [B,H,n_lat,|source|]
+    Vc = v_f[:, :, idx, :]  # [B,H,|source|,D]
+
+    onehot = torch.nn.functional.one_hot(cell_id, num_classes=r_eff).to(Ac.dtype)  # [|source|,r_eff]
+    counts = onehot.sum(dim=0).clamp(min=1)  # [r_eff]
+    Vbar = torch.einsum("rj,bhrd->bhjd", onehot, Vc) / counts[None, None, :, None]  # [B,H,r_eff,D]
+    massb = torch.einsum("bhqr,rj->bhqj", Ac, onehot)  # [B,H,n_lat,r_eff]
+
+    original_contrib = torch.einsum("bhqk,bhkd->bhqd", Ac, Vc)
+    pooled_contrib = torch.einsum("bhqj,bhjd->bhqd", massb, Vbar)
+
+    foreign_f = foreign.to(Ac.dtype)[None, None, :, None]
+    O[:, :, lat_slice, :] += foreign_f * (pooled_contrib - original_contrib)
+
+
+def rank_limited_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    layout: SequenceLayout,
+    r: int,
+    text_r: int | None = None,
+    text_hard: bool = False,
+) -> Tensor:
     """Restrict cross-region information by CAPACITY (rank) instead of magnitude.
 
     Starts from full, standard attention (softmax denominator untouched, nothing zeroed or
-    renormalized) and, for each foreign visual source, REPLACES what a query actually read
-    from that source with a pooled (<= r independent vectors) version, using the exact same
-    total attention mass that query already earned. Every replacement is a convex combination
-    of real V rows for that one query alone - never blended across different queries the way
-    the spatial blur is - so it's hull-preserving at any r, which is the property that should
-    let it tolerate being applied at every block/step where the blur couldn't.
+    renormalized) and, for each foreign source, REPLACES what a query actually read from it
+    with a pooled (<= r independent vectors) version, using the exact same total attention
+    mass that query already earned. Every replacement is a convex combination of real V rows
+    for that one query alone - never blended across different queries the way the spatial
+    blur is - so it's hull-preserving at any r, which is the property that should let it
+    tolerate being applied at every block/step where the blur couldn't.
 
     At r >= a source's own token count this exactly reproduces vanilla_attention for that
-    source (no restriction possible). Scoped to visual cross-sources only, matching the
-    proposal - foreign TEXT is left untouched here; layer a separate text policy on top if
-    still wanted.
+    source (no restriction possible).
+
+    `r` governs visual cross-sources (other-instance/background latent+context), pooled over
+    a spatial bbox grid. Foreign text is handled by (at most) ONE of two alternative,
+    mutually-exclusive mechanisms:
+      text_r    - the same rank-pooling mechanism as visual sources, applied to text.
+      text_hard - clean pre-softmax segmentation instead (foreign text masked to -inf before
+                  the softmax that produces the base A, so it's properly renormalized rather
+                  than approximated by pooling). Recommended when you want a genuinely clean
+                  per-instance text segmentation rather than a rank-r approximation of one.
+    Neither is applied when both are left at their defaults (None/False) - matching the
+    original proposal's stated scope of visual-only restriction.
     """
-    D = q.shape[-1]
-    logits = torch.einsum("bhqd,bhkd->bhqk", q.float(), k.float()) * D**-0.5
-    A = torch.softmax(logits, dim=-1)
+    assert not (text_r is not None and text_hard), "text_r and text_hard are alternatives - pick one"
+    A = _compute_A(q, k, layout, text_hard=text_hard)
     v_f = v.float()
 
     O = torch.einsum("bhqk,bhkd->bhqd", A, v_f)  # full, unmodified attention - the base
@@ -273,24 +366,20 @@ def rank_limited_attention(q: Tensor, k: Tensor, v: Tensor, layout: SequenceLayo
         idx = key_mask.nonzero(as_tuple=True)[0]
         if idx.numel() == 0 or not foreign.any():
             continue
-
-        Ac = A_lat[:, :, :, idx]  # [B,H,n_lat,|region|]
-        Vc = v_f[:, :, idx, :]  # [B,H,|region|,D]
-
         cell_id, r_eff = _cell_ids_for_region(layout, idx, r)
         if r_eff >= idx.numel():
             continue  # pooling into >= as many cells as tokens changes nothing
+        _pool_and_replace(O, A_lat, v_f, lat_slice, idx, foreign, cell_id, r_eff)
 
-        onehot = torch.nn.functional.one_hot(cell_id, num_classes=r_eff).to(Ac.dtype)  # [|region|, r_eff]
-        counts = onehot.sum(dim=0).clamp(min=1)  # [r_eff]
-        Vbar = torch.einsum("rj,bhrd->bhjd", onehot, Vc) / counts[None, None, :, None]  # [B,H,r_eff,D]
-        massb = torch.einsum("bhqr,rj->bhqj", Ac, onehot)  # [B,H,n_lat,r_eff]
-
-        original_contrib = torch.einsum("bhqk,bhkd->bhqd", Ac, Vc)
-        pooled_contrib = torch.einsum("bhqj,bhjd->bhqd", massb, Vbar)
-
-        foreign_f = foreign.to(A.dtype)[None, None, :, None]
-        O[:, :, lat_slice, :] += foreign_f * (pooled_contrib - original_contrib)
+    if text_r is not None:
+        for key_mask, foreign in _text_cross_sources(layout):
+            idx = key_mask.nonzero(as_tuple=True)[0]
+            if idx.numel() == 0 or not foreign.any():
+                continue
+            cell_id, r_eff = _cell_ids_sequential(idx.numel(), text_r, idx.device)
+            if r_eff >= idx.numel():
+                continue
+            _pool_and_replace(O, A_lat, v_f, lat_slice, idx, foreign, cell_id, r_eff)
 
     return O.to(v.dtype)
 

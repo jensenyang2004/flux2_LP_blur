@@ -124,7 +124,8 @@ def encode_instance_prompts(text_encoder: Qwen3Embedder, sample: SampleSpec, ins
 
 
 def _make_gated_attn_fn(
-    original_fn, blocks_per_forward, gated_steps, gated_blocks, layout, num_txt, n_target, n_context, mode, sigma, r
+    original_fn, blocks_per_forward, gated_steps, gated_blocks, layout, num_txt, n_target, n_context,
+    mode, sigma, r, text_r, text_hard,
 ):
     state = {"call_count": 0}
 
@@ -139,7 +140,7 @@ def _make_gated_attn_fn(
             if mode == "hard":
                 out_l = hard_masked_attention(q_l, k_l, v_l, layout)
             elif mode == "rank":
-                out_l = rank_limited_attention(q_l, k_l, v_l, layout, r=r)
+                out_l = rank_limited_attention(q_l, k_l, v_l, layout, r=r, text_r=text_r, text_hard=text_hard)
             else:
                 out_l = mice_lp_attention(q_l, k_l, v_l, layout, sigma=sigma)
             out = from_layout_order(out_l, num_txt, n_target, n_context)
@@ -156,6 +157,8 @@ def generate(
     mode: str = "blur",
     sigma: float = 2.0,
     r: int = 1,
+    text_r: int | None = None,
+    text_hard: bool = False,
     gated_steps: list[int] | None = None,
     gated_blocks: list[int] | None = None,
     model_name: str = "flux.2-klein-4b",
@@ -227,12 +230,12 @@ def generate(
             )
         else:
             blocks_per_forward = len(model.double_blocks) + len(model.single_blocks)
-            extra = f"r={r}" if mode == "rank" else f"sigma={sigma}"
+            extra = f"r={r} text_r={text_r} text_hard={text_hard}" if mode == "rank" else f"sigma={sigma}"
             print(f"mode={mode}: gating steps={sorted(gated_steps)} blocks={sorted(gated_blocks)} {extra}")
             original_fn = flux2_model.causal_attn_fn
             flux2_model.causal_attn_fn = _make_gated_attn_fn(
                 original_fn, blocks_per_forward, gated_steps, gated_blocks,
-                layout, num_txt_tokens, n_target, n_context, mode, sigma, r,
+                layout, num_txt_tokens, n_target, n_context, mode, sigma, r, text_r, text_hard,
             )
             try:
                 x = denoise(
@@ -261,18 +264,30 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--mode", choices=["plain", "hard", "blur", "rank"], default="blur")
     parser.add_argument("--sigma", type=float, default=2.0, help="blur mode only")
-    parser.add_argument("--r", type=int, default=1, help="rank mode only - cells per foreign region (1=max bottleneck)")
+    parser.add_argument("--r", type=int, default=1, help="rank mode only - cells per foreign VISUAL region (1=max bottleneck)")
+    parser.add_argument(
+        "--text-r", type=int, default=None,
+        help="rank mode only, alternative to --text-hard - cells per OTHER instance's text span "
+        "(default: untouched, full-resolution foreign text access)",
+    )
+    parser.add_argument(
+        "--text-hard", action="store_true",
+        help="rank mode only, alternative to --text-r - clean pre-softmax segmentation: foreign "
+        "text masked to -inf before softmax, properly renormalized (not a rank approximation)",
+    )
     parser.add_argument("--gated-steps", type=str, default=None, help="comma-separated 0-indexed step indices, e.g. 2,3")
     parser.add_argument("--gated-blocks", type=str, default=None, help="comma-separated 0-indexed block indices (0..24 for Klein-4B)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.text_r is not None and args.text_hard:
+        parser.error("--text-r and --text-hard are alternatives - pass at most one")
 
     gated_steps = [int(s) for s in args.gated_steps.split(",")] if args.gated_steps else None
     gated_blocks = [int(s) for s in args.gated_blocks.split(",")] if args.gated_blocks else None
 
     generate(
         args.data_root, args.sample, args.out,
-        mode=args.mode, sigma=args.sigma, r=args.r,
+        mode=args.mode, sigma=args.sigma, r=args.r, text_r=args.text_r, text_hard=args.text_hard,
         gated_steps=gated_steps, gated_blocks=gated_blocks, seed=args.seed,
     )
 
